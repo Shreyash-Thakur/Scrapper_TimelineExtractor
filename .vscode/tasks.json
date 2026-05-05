@@ -1,0 +1,104 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run scraper to CSV",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3",
+				"python_scraper_unmatchedkicks.py",
+				"--input",
+				"urls.txt",
+				"--output",
+				"results.csv",
+				"--workers",
+				"4",
+				"--delay",
+				"1.5"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "test"
+		},
+		{
+			"label": "run scraper slowly",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3",
+				"python_scraper_unmatchedkicks.py",
+				"--input",
+				"urls.txt",
+				"--output",
+				"results.csv",
+				"--failed",
+				"failed_urls.txt",
+				"--playwright",
+				"--workers",
+				"1",
+				"--delay",
+				"3"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "py_compile scraper",
+			"type": "shell",
+			"command": "py -3",
+			"args": [
+				"-m",
+				"py_compile",
+				"python_scraper_unmatchedkicks.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "py_compile scraper fixed",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3",
+				"-m",
+				"py_compile",
+				"python_scraper_unmatchedkicks.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "run scraper to xlsx",
+			"type": "shell",
+			"command": "py",
+			"args": [
+				"-3",
+				"python_scraper_unmatchedkicks.py",
+				"--input",
+				"urls.txt",
+				"--output",
+				"results.xlsx",
+				"--workers",
+				"2",
+				"--delay",
+				"3",
+				"--playwright"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		}
+	]
+}

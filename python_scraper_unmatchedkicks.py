@@ -40,14 +40,13 @@ OUTPUT
 
 import argparse
 import asyncio
-import csv
 import logging
 import random
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -200,7 +199,7 @@ class RequestsScraper:
                     time.sleep(self.delay * attempt)
         return None
 
-    def scrape(self, url: str) -> str:
+    def scrape(self, url: str) -> Optional[str]:
         html = self.fetch(url)
         if html is None:
             return None  # signal failure
@@ -209,7 +208,7 @@ class RequestsScraper:
 
 # ── Playwright Scraper (async) ────────────────────────────────────────────────
 
-async def playwright_scrape_batch(urls: list[str], delay: float = 1.5, retries: int = 3):
+async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: int = 3):
     """Scrape a list of URLs using Playwright (headless Chromium)."""
     try:
         from playwright.async_api import async_playwright
@@ -260,7 +259,7 @@ async def playwright_scrape_batch(urls: list[str], delay: float = 1.5, retries: 
 
 # ── Main Orchestration ────────────────────────────────────────────────────────
 
-def load_urls(path: str) -> list[str]:
+def load_urls(path: str) -> List[str]:
     urls = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -274,7 +273,7 @@ def load_urls(path: str) -> list[str]:
 
 
 def run_requests_mode(
-    urls: list[str],
+    urls: List[str],
     output_path: str,
     failed_path: str,
     workers: int,
@@ -290,7 +289,7 @@ def run_requests_mode(
 
     def process(url: str):
         # Jitter to avoid synchronized bursts across threads
-        time.sleep(random.uniform(0, delay))
+        time.sleep(delay + random.uniform(0, 0.75))
         shipping = scraper.scrape(url)
         return url, shipping
 
@@ -306,10 +305,10 @@ def run_requests_mode(
             else:
                 results.append({"product_url": url, "shipping_timeline": shipping})
                 log.info(f"[{done}/{total}] {url} → {shipping}")
-            # Throttle: sleep between completions regardless of threads
-            time.sleep(delay / workers)
+                # Extra throttle between completions regardless of threads
+                time.sleep(delay)
 
-    write_csv(results, output_path)
+    write_results(results, output_path)
     write_failed(failed, failed_path)
     log.info(f"\n✅ Done. {len(results)} scraped | {len(failed)} failed")
     log.info(f"   Output:  {output_path}")
@@ -317,7 +316,7 @@ def run_requests_mode(
 
 
 def run_playwright_mode(
-    urls: list[str],
+    urls: List[str],
     output_path: str,
     failed_path: str,
     delay: float,
@@ -334,25 +333,55 @@ def run_playwright_mode(
         else:
             results.append({"product_url": url, "shipping_timeline": shipping})
 
-    write_csv(results, output_path)
+    write_results(results, output_path)
     write_failed(failed, failed_path)
     log.info(f"\n✅ Done. {len(results)} scraped | {len(failed)} failed")
     log.info(f"   Output:  {output_path}")
     log.info(f"   Failed:  {failed_path}")
 
 
-def write_csv(rows: list[dict], path: str):
+def write_results(rows: List[dict], path: str):
+    suffix = Path(path).suffix.lower()
+    if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font
+        except ImportError:
+            raise SystemExit("openpyxl is required for Excel output. Install it with: pip install openpyxl")
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "results"
+
+        headers = ["product_url", "shipping_timeline"]
+        for column_index, header in enumerate(headers, start=1):
+            cell = sheet.cell(row=1, column=column_index, value=header)
+            cell.font = Font(bold=True)
+
+        for row_index, row in enumerate(rows, start=2):
+            url_cell = sheet.cell(row=row_index, column=1, value=row["product_url"])
+            url_cell.hyperlink = row["product_url"]
+            url_cell.style = "Hyperlink"
+            sheet.cell(row=row_index, column=2, value=row["shipping_timeline"])
+
+        sheet.column_dimensions["A"].width = 75
+        sheet.column_dimensions["B"].width = 24
+        workbook.save(path)
+        return
+
+    import csv
+
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=["product_url", "shipping_timeline"],
-            quoting=csv.QUOTE_ALL,  # always quote — prevents "Ships In 14 Days" splitting on comma
+            quoting=csv.QUOTE_ALL,
         )
         writer.writeheader()
         writer.writerows(rows)
 
 
-def write_failed(urls: list[str], path: str):
+def write_failed(urls: List[str], path: str):
     with open(path, "w", encoding="utf-8") as f:
         for url in urls:
             f.write(url + "\n")
@@ -366,11 +395,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--input", required=True, help="Path to text file with one URL per line")
-    p.add_argument("--output", default="results.csv", help="Output CSV path (default: results.csv)")
+    p.add_argument("--input", default="urls.txt", help="Path to text file with one URL per line (default: urls.txt)")
+    p.add_argument("--output", default="results.xlsx", help="Output file path (default: results.xlsx)")
     p.add_argument("--failed", default="failed_urls.txt", help="Path to write failed URLs (default: failed_urls.txt)")
-    p.add_argument("--workers", type=int, default=4, help="Concurrent workers for requests mode (default: 4)")
-    p.add_argument("--delay", type=float, default=1.5, help="Seconds between requests per worker (default: 1.5)")
+    p.add_argument("--workers", type=int, default=2, help="Concurrent workers for requests mode (default: 2)")
+    p.add_argument("--delay", type=float, default=2.5, help="Seconds between requests per worker (default: 2.5)")
     p.add_argument("--retries", type=int, default=3, help="Retry attempts per URL (default: 3)")
     p.add_argument("--playwright", action="store_true", help="Use Playwright (headless browser) instead of requests")
     return p
@@ -379,8 +408,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    log.info(f"Checking input: {args.input} exists={Path(args.input).exists()} cwd={Path('.').resolve()}")
 
-    urls = load_urls(args.input)
+    try:
+        urls = load_urls(args.input)
+    except FileNotFoundError:
+        log.error(f"Input file not found: {args.input}")
+        sys.exit(2)
+
     if not urls:
         log.error("No URLs loaded. Check your input file.")
         sys.exit(1)
