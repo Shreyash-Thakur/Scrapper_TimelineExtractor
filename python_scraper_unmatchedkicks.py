@@ -343,7 +343,11 @@ def run_playwright_mode(
 
 def write_csv(rows: list[dict], path: str):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["product_url", "shipping_timeline"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["product_url", "shipping_timeline"],
+            quoting=csv.QUOTE_ALL,  # always quote — prevents "Ships In 14 Days" splitting on comma
+        )
         writer.writeheader()
         writer.writerows(rows)
 
