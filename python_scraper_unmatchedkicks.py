@@ -1,29 +1,32 @@
 """
-Shipping Timeline Scraper — unmatchedkicks.in
-=============================================
+Shipping Timeline Scraper — unmatchedkicks.in (FINAL VERSION)
+==============================================================
 Run this script on YOUR LOCAL MACHINE (not a cloud server).
 The site blocks datacenter IPs; residential/home IPs work fine.
+
+FEATURES
+--------
+✓ Playwright mode for JavaScript-rendered content (recommended)
+✓ Requests mode with session management
+✓ Intelligent detection of shipping data vs. size data
+✓ Multiple extraction patterns (JSON-LD, buttons, form elements, text content)
+✓ Excel output with hyperlinked URLs
+✓ Detailed logging and retry logic
 
 USAGE
 -----
 # Install dependencies (once):
-    pip install requests beautifulsoup4 playwright
-    playwright install chromium        # only needed if --playwright flag is used
+    pip install requests beautifulsoup4 playwright openpyxl
+    playwright install chromium
 
-# Basic (requests + BS4, fastest):
-    python scraper_unmatchedkicks.py --input urls.txt --output results.csv
+# Recommended (Playwright - handles JavaScript):
+    python python_scraper_unmatchedkicks.py --input urls.txt --output results.xlsx --playwright --delay 3
 
-# Playwright mode (handles JS-rendered pages):
-    python scraper_unmatchedkicks.py --input urls.txt --output results.csv --playwright
+# Alternative (Requests - faster but less reliable):
+    python python_scraper_unmatchedkicks.py --input urls.txt --output results.xlsx --workers 2 --delay 2.5
 
-# All options:
-    python scraper_unmatchedkicks.py \
-        --input urls.txt \
-        --output results.csv \
-        --failed failed_urls.txt \
-        --workers 5 \
-        --delay 1.5 \
-        --retries 3
+# Re-validate and fix incomplete entries:
+    python validate_and_rescrape_unmatchedkicks.py --input results.xlsx --output results_fixed.xlsx --playwright
 
 INPUT FILE FORMAT (urls.txt)
 -----------------------------
@@ -34,7 +37,7 @@ Example:
 
 OUTPUT
 ------
-  results.csv       — product_url, shipping_timeline
+  results.xlsx      — product_url (clickable links), shipping_timeline
   failed_urls.txt   — URLs that failed after all retries
 """
 
@@ -51,6 +54,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    print("openpyxl required. Install with: pip install openpyxl")
+    sys.exit(1)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -78,75 +89,149 @@ BASE_HEADERS = {
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
-    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
 }
 
-# Patterns to strip from Pattern-1 text
-STRIP_PREFIXES = re.compile(
-    r"(?i)^(this product will be shipped (within|in)\s*|shipped (within|in)\s*|ships in\s*)",
-    re.IGNORECASE,
-)
+
+# ── Validation & Extraction Logic ────────────────────────────────────────────
+
+VALID_SHIPPING_KEYWORDS = {
+    r"ship",  # "Ships In", "shipped within"
+    r"deliver",  # "Delivery timeline", "deliver"
+    r"days?",  # "Days", "day"
+    r"working",  # "Working days"
+    r"same\s*day",  # "Same day delivery"
+    r"hours?",  # "Hours"
+    r"week",  # "Week(s)"
+}
+
+INVALID_KEYWORDS = {
+    r"^(xxs|xs|s|m|l|xl|xxl|one\s*size)$",  # Size indicators
+    r"^\d+\.\d{2}$",  # Price (e.g., "8999.00")
+    r"^(₹|rs\.?)\s*\d+",  # Indian Rupees
+    r"^n/a$",  # Placeholder
+}
 
 
-# ── Extraction Logic ──────────────────────────────────────────────────────────
+def is_valid_shipping_text(text: str) -> bool:
+    """Check if text is valid shipping timeline data."""
+    text_lower = text.lower().strip()
+    
+    # Check for invalid patterns (sizes, prices, etc.)
+    for pattern in INVALID_KEYWORDS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return False
+    
+    # Check for valid patterns
+    for pattern in VALID_SHIPPING_KEYWORDS:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True
+    
+    return False
+
 
 def extract_shipping(html: str) -> str:
     """
-    Parse HTML and extract shipping timeline.
-    Priority: Pattern 2 → Pattern 1 → "N/A"
+    ENHANCED extraction with multiple patterns and validation.
+    Priority:
+    1. JSON-LD structured data
+    2. Button/form with "SHIPS IN X DAYS"
+    3. Legend + span (form-based selector)
+    4. Input value attribute
+    5. Text-truncator paragraph
+    6. Delivery timeline heading + content
+    7. Badges/labels with shipping keywords
+    8. General paragraphs with shipping info
     """
     soup = BeautifulSoup(html, "html.parser")
-
-    # ── Pattern 2a: <legend> → <span data-selected-value> ──────────────────
+    
+    # ── Pattern 0: JSON-LD Structured Data ──────────────────────────────────
+    scripts = soup.find_all("script", {"type": "application/ld+json"})
+    for script in scripts:
+        try:
+            import json
+            data = json.loads(script.string)
+            if isinstance(data, dict) and "aggregateOffer" in data:
+                agg = data["aggregateOffer"]
+                if isinstance(agg, dict) and "offers" in agg:
+                    offers = agg["offers"]
+                    if isinstance(offers, list) and len(offers) > 0:
+                        offer = offers[0]
+                        if isinstance(offer, dict) and "shippingDetails" in offer:
+                            shipping = offer["shippingDetails"]
+                            if isinstance(shipping, dict) and "deliveryTime" in shipping:
+                                delivery = shipping["deliveryTime"]
+                                if isinstance(delivery, dict) and "businessDays" in delivery:
+                                    days = delivery["businessDays"]
+                                    text = f"Ships In {days} Days"
+                                    if is_valid_shipping_text(text):
+                                        return clean_text(text)
+        except:
+            pass
+    
+    # ── Pattern 1: Button with "SHIPS IN X DAYS" ───────────────────────────
+    for button in soup.find_all(["button", "div"], string=re.compile(r"ships?\s+in", re.I)):
+        text = button.get_text(strip=True)
+        if text and is_valid_shipping_text(text):
+            return clean_text(text)
+    
+    # ── Pattern 2: Legend + Span (form-based delivery selector) ─────────────
     span = soup.select_one("legend.form__label span[data-selected-value]")
     if span:
         text = span.get_text(strip=True)
-        if text:
+        if text and is_valid_shipping_text(text):
             return clean_text(text)
-
-    # ── Pattern 2b: <input value="Ships In ..."> ────────────────────────────
+    
+    # ── Pattern 3: Input value attribute ────────────────────────────────────
     inp = soup.select_one('input[value*="Ships"], input[value*="ships"]')
     if inp:
         text = inp.get("value", "").strip()
-        if text:
+        if text and is_valid_shipping_text(text):
             return clean_text(text)
-
-    # ── Pattern 2c: any element containing "Ships In" (broader fallback) ────
-    for tag in soup.find_all(string=re.compile(r"Ships\s+[Ii]n\s+\d", re.I)):
-        text = tag.strip()
-        if text:
-            return clean_text(text)
-
-    # ── Pattern 1: .text-truncator p ────────────────────────────────────────
+    
+    # ── Pattern 4: Text-truncator paragraph ──────────────────────────────────
     p = soup.select_one(".text-truncator p")
     if p:
         text = p.get_text(strip=True)
-        if text:
+        if text and is_valid_shipping_text(text):
             return clean_text(text)
-
-    # ── Broader Pattern 1 fallback: any <p> mentioning shipping ─────────────
-    for p_tag in soup.find_all("p"):
+    
+    # ── Pattern 5: Delivery timeline heading + sibling ──────────────────────
+    for heading in soup.find_all(["h2", "h3", "h4", "div"], string=re.compile(r"delivery\s+timeline", re.I)):
+        for sibling in heading.find_next_siblings(["div", "p", "span"], limit=3):
+            text = sibling.get_text(strip=True)
+            if text and is_valid_shipping_text(text):
+                return clean_text(text)
+    
+    # ── Pattern 6: Badge/Label with shipping keywords ──────────────────────
+    for badge in soup.find_all(["span", "div"], class_=re.compile(r"badge|label|tag|pill", re.I)):
+        text = badge.get_text(strip=True)
+        if text and is_valid_shipping_text(text) and 5 < len(text) < 100:
+            return clean_text(text)
+    
+    # ── Pattern 7: Blue highlighted box (common pattern) ────────────────────
+    for div in soup.find_all("div", style=re.compile(r"background", re.I)):
+        text = div.get_text(strip=True)
+        if text and is_valid_shipping_text(text) and 5 < len(text) < 150:
+            return clean_text(text)
+    
+    # ── Pattern 8: Broad search - paragraphs with shipping keywords ────────
+    for p_tag in soup.find_all("p", limit=100):
         text = p_tag.get_text(strip=True)
-        if re.search(r"ship(ped|ping|s)?\s+(within|in)\s+\d", text, re.I):
+        if text and is_valid_shipping_text(text) and 5 < len(text) < 200:
             return clean_text(text)
-
+    
     return "N/A"
 
 
 def clean_text(text: str) -> str:
-    """Remove known boilerplate prefixes and normalise whitespace."""
+    """Remove boilerplate prefixes and normalize whitespace."""
     text = text.strip()
-    # Remove "Delivery Timeline:" prefix (from legend label text leaking in)
+    # Remove common prefixes
     text = re.sub(r"(?i)^delivery\s+timeline\s*:\s*", "", text).strip()
-    # Remove "This product will be shipped within"
     text = re.sub(r"(?i)^this product will be shipped (within|in)\s*", "", text).strip()
-    # Remove "shipped within / shipped in"
     text = re.sub(r"(?i)^shipped (within|in)\s*", "", text).strip()
-    # Remove standalone "Ships In" only if followed by something (keep "Ships In 14 Days")
-    # We keep "Ships In X Days" as-is — it's already clean
-    # Normalise internal whitespace
+    text = re.sub(r"(?i)^ships?\s+(in|within)\s+", "Ships In ", text).strip()
+    # Normalize whitespace
     text = " ".join(text.split())
     return text if text else "N/A"
 
@@ -154,11 +239,10 @@ def clean_text(text: str) -> str:
 # ── HTTP Scraper (requests) ───────────────────────────────────────────────────
 
 class RequestsScraper:
-    def __init__(self, retries: int = 3, delay: float = 1.5):
+    def __init__(self, retries: int = 3, delay: float = 2.0):
         self.retries = retries
         self.delay = delay
         self.session = requests.Session()
-        # Warm up session with a homepage hit (gets cookies)
         try:
             self.session.get(
                 "https://unmatchedkicks.in/",
@@ -185,14 +269,14 @@ class RequestsScraper:
                 if resp.status_code == 200:
                     return resp.text
                 elif resp.status_code in (429, 503):
-                    wait = self.delay * (2 ** attempt) + random.uniform(0, 1)
+                    wait = self.delay * (2 ** attempt)
                     log.warning(f"Rate limited ({resp.status_code}) on {url}. Waiting {wait:.1f}s…")
                     time.sleep(wait)
                 elif resp.status_code == 404:
                     log.warning(f"404 Not Found: {url}")
                     return None
                 else:
-                    log.warning(f"HTTP {resp.status_code} for {url} (attempt {attempt})")
+                    log.warning(f"HTTP {resp.status_code} for {url}")
             except requests.exceptions.RequestException as e:
                 log.warning(f"Request error on {url} attempt {attempt}: {e}")
                 if attempt < self.retries:
@@ -202,14 +286,14 @@ class RequestsScraper:
     def scrape(self, url: str) -> Optional[str]:
         html = self.fetch(url)
         if html is None:
-            return None  # signal failure
+            return None
         return extract_shipping(html)
 
 
 # ── Playwright Scraper (async) ────────────────────────────────────────────────
 
-async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: int = 3):
-    """Scrape a list of URLs using Playwright (headless Chromium)."""
+async def playwright_scrape_batch(urls: List[str], delay: float = 2.0, retries: int = 3):
+    """Scrape a list of URLs using Playwright."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -222,9 +306,7 @@ async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: 
         context = await browser.new_context(
             user_agent=random.choice(USER_AGENTS),
             locale="en-IN",
-            extra_http_headers={
-                "Accept-Language": "en-IN,en;q=0.9",
-            },
+            extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"},
         )
         page = await context.new_page()
 
@@ -232,14 +314,17 @@ async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: 
             for attempt in range(1, retries + 1):
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    # Wait for shipping-related element or settle
+                    
+                    # Wait for shipping-related elements
                     try:
                         await page.wait_for_selector(
-                            "legend.form__label, .text-truncator",
+                            "legend.form__label, .text-truncator, button, [class*='delivery']",
                             timeout=5000,
                         )
-                    except Exception:
-                        pass  # element may not exist; continue with what loaded
+                    except:
+                        pass
+                    
+                    await asyncio.sleep(0.5)
                     html = await page.content()
                     shipping = extract_shipping(html)
                     results[url] = shipping
@@ -249,7 +334,7 @@ async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: 
                 except Exception as e:
                     log.warning(f"[PW] Error on {url} attempt {attempt}: {e}")
                     if attempt == retries:
-                        results[url] = None
+                        results[url] = "N/A"
                     else:
                         await asyncio.sleep(delay * attempt)
 
@@ -260,12 +345,12 @@ async def playwright_scrape_batch(urls: List[str], delay: float = 1.5, retries: 
 # ── Main Orchestration ────────────────────────────────────────────────────────
 
 def load_urls(path: str) -> List[str]:
+    """Load URLs from text file."""
     urls = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
-                # Accept bare slugs too
                 if not line.startswith("http"):
                     line = f"https://unmatchedkicks.in/products/{line}"
                 urls.append(line)
@@ -280,6 +365,7 @@ def run_requests_mode(
     delay: float,
     retries: int,
 ):
+    """Run scraper using requests + threading."""
     scraper = RequestsScraper(retries=retries, delay=delay)
     results = []
     failed = []
@@ -288,8 +374,7 @@ def run_requests_mode(
     log.info(f"Starting requests mode | {total} URLs | {workers} workers | delay={delay}s")
 
     def process(url: str):
-        # Jitter to avoid synchronized bursts across threads
-        time.sleep(delay + random.uniform(0, 0.75))
+        time.sleep(delay + random.uniform(0, 1))
         shipping = scraper.scrape(url)
         return url, shipping
 
@@ -305,10 +390,9 @@ def run_requests_mode(
             else:
                 results.append({"product_url": url, "shipping_timeline": shipping})
                 log.info(f"[{done}/{total}] {url} → {shipping}")
-                # Extra throttle between completions regardless of threads
-                time.sleep(delay)
+            time.sleep(delay / workers)
 
-    write_results(results, output_path)
+    write_results_excel(results, output_path)
     write_failed(failed, failed_path)
     log.info(f"\n✅ Done. {len(results)} scraped | {len(failed)} failed")
     log.info(f"   Output:  {output_path}")
@@ -322,66 +406,59 @@ def run_playwright_mode(
     delay: float,
     retries: int,
 ):
+    """Run scraper using Playwright."""
     log.info(f"Starting Playwright mode | {len(urls)} URLs | delay={delay}s")
     results_map = asyncio.run(playwright_scrape_batch(urls, delay=delay, retries=retries))
 
     results = []
     failed = []
     for url, shipping in results_map.items():
-        if shipping is None:
+        if shipping is None or shipping == "N/A":
             failed.append(url)
         else:
             results.append({"product_url": url, "shipping_timeline": shipping})
 
-    write_results(results, output_path)
+    write_results_excel(results, output_path)
     write_failed(failed, failed_path)
     log.info(f"\n✅ Done. {len(results)} scraped | {len(failed)} failed")
     log.info(f"   Output:  {output_path}")
     log.info(f"   Failed:  {failed_path}")
 
 
-def write_results(rows: List[dict], path: str):
-    suffix = Path(path).suffix.lower()
-    if suffix in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        try:
-            from openpyxl import Workbook
-            from openpyxl.styles import Font
-        except ImportError:
-            raise SystemExit("openpyxl is required for Excel output. Install it with: pip install openpyxl")
+def write_results_excel(rows: List[dict], path: str):
+    """Write results to Excel with hyperlinked URLs."""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "results"
 
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.title = "results"
+    # Headers
+    headers = ["product_url", "shipping_timeline"]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = sheet.cell(row=1, column=col_idx, value=header)
+        cell.font = Font(bold=True)
 
-        headers = ["product_url", "shipping_timeline"]
-        for column_index, header in enumerate(headers, start=1):
-            cell = sheet.cell(row=1, column=column_index, value=header)
-            cell.font = Font(bold=True)
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        url = row["product_url"]
+        timeline = row["shipping_timeline"]
+        
+        # Hyperlink in column A
+        url_cell = sheet.cell(row=row_idx, column=1, value=url)
+        url_cell.hyperlink = url
+        url_cell.font = Font(color="0563C1", underline="single")
+        
+        # Timeline in column B
+        sheet.cell(row=row_idx, column=2, value=timeline)
 
-        for row_index, row in enumerate(rows, start=2):
-            url_cell = sheet.cell(row=row_index, column=1, value=row["product_url"])
-            url_cell.hyperlink = row["product_url"]
-            url_cell.style = "Hyperlink"
-            sheet.cell(row=row_index, column=2, value=row["shipping_timeline"])
+    # Column widths
+    sheet.column_dimensions["A"].width = 75
+    sheet.column_dimensions["B"].width = 30
 
-        sheet.column_dimensions["A"].width = 75
-        sheet.column_dimensions["B"].width = 24
-        workbook.save(path)
-        return
-
-    import csv
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["product_url", "shipping_timeline"],
-            quoting=csv.QUOTE_ALL,
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+    workbook.save(path)
 
 
 def write_failed(urls: List[str], path: str):
+    """Write failed URLs to text file."""
     with open(path, "w", encoding="utf-8") as f:
         for url in urls:
             f.write(url + "\n")
@@ -395,20 +472,19 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--input", default="urls.txt", help="Path to text file with one URL per line (default: urls.txt)")
-    p.add_argument("--output", default="results.xlsx", help="Output file path (default: results.xlsx)")
-    p.add_argument("--failed", default="failed_urls.txt", help="Path to write failed URLs (default: failed_urls.txt)")
-    p.add_argument("--workers", type=int, default=2, help="Concurrent workers for requests mode (default: 2)")
-    p.add_argument("--delay", type=float, default=2.5, help="Seconds between requests per worker (default: 2.5)")
-    p.add_argument("--retries", type=int, default=3, help="Retry attempts per URL (default: 3)")
-    p.add_argument("--playwright", action="store_true", help="Use Playwright (headless browser) instead of requests")
+    p.add_argument("--input", default="urls.txt", help="Input file with URLs (default: urls.txt)")
+    p.add_argument("--output", default="results.xlsx", help="Output Excel file (default: results.xlsx)")
+    p.add_argument("--failed", default="failed_urls.txt", help="Failed URLs file (default: failed_urls.txt)")
+    p.add_argument("--workers", type=int, default=2, help="Concurrent workers (default: 2)")
+    p.add_argument("--delay", type=float, default=2.5, help="Delay between requests (default: 2.5)")
+    p.add_argument("--retries", type=int, default=3, help="Retry attempts (default: 3)")
+    p.add_argument("--playwright", action="store_true", help="Use Playwright instead of requests")
     return p
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    log.info(f"Checking input: {args.input} exists={Path(args.input).exists()} cwd={Path('.').resolve()}")
 
     try:
         urls = load_urls(args.input)
